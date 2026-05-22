@@ -16,6 +16,7 @@ tcpServer.listen(TCP_PORT, () => {
 
 // State
 let stm32Device = null; 
+let deviceCheckInterval = null;
 const frontendClients = new Set();
 
 function broadcastToFrontends(data) {
@@ -27,6 +28,43 @@ function broadcastToFrontends(data) {
   }
 }
 
+// Проверка живого соединения с STM32
+function checkDeviceConnection() {
+  if (stm32Device) {
+    // Проверяем, что сокет еще живой
+    if (stm32Device.destroyed || stm32Device.readyState === 'closed') {
+      console.log('[HEARTBEAT] Device socket is dead, disconnecting...');
+      if (stm32Device === stm32Device) {
+        stm32Device = null;
+        broadcastToFrontends({ type: 'device_connection', online: false });
+      }
+      return;
+    }
+    
+    // Попытка проверить соединение через write без данных
+    try {
+      // Проверяем writable состояние
+      if (!stm32Device.writable) {
+        console.log('[HEARTBEAT] Device socket not writable, disconnecting...');
+        stm32Device = null;
+        broadcastToFrontends({ type: 'device_connection', online: false });
+        return;
+      }
+    } catch (e) {
+      console.log('[HEARTBEAT] Exception checking socket:', e.message);
+      stm32Device = null;
+      broadcastToFrontends({ type: 'device_connection', online: false });
+    }
+  }
+}
+
+function startDeviceCheck() {
+  if (!deviceCheckInterval) {
+    deviceCheckInterval = setInterval(checkDeviceConnection, 1000); // Проверка каждую секунду
+    console.log('[HEARTBEAT] Device connection check started (every 1s)');
+  }
+}
+
 function handleDeviceMessage(data) {
   // Broadcast device messages (status, telemetry) to all frontends
   broadcastToFrontends(data);
@@ -34,7 +72,14 @@ function handleDeviceMessage(data) {
 
 // ---- TCP LOGIC (STM32) ----
 tcpServer.on('connection', (socket) => {
-  console.log('TCP Device (STM32) connected');
+  console.log('[CONNECT] TCP Device (STM32) connected', { remoteAddress: socket.remoteAddress, remotePort: socket.remotePort });
+  
+  // Включаем TCP Keep-Alive для обнаружения отключения
+  socket.setKeepAlive(true, 2000); // Проверка каждые 2 сек после 2 сек неактивности
+  socket.setNoDelay(true); // Отключаем Nagle для быстрой отправки
+  socket.setTimeout(30000); // 30 сек timeout
+  
+  startDeviceCheck();
   
   if (stm32Device && stm32Device !== socket) {
       console.log('Old STM32 device disconnected in favor of a new one');
@@ -42,41 +87,75 @@ tcpServer.on('connection', (socket) => {
   }
   
   stm32Device = socket;
+  let lastDataTime = Date.now();
+  
   broadcastToFrontends({ type: 'device_connection', online: true });
 
   let buffer = '';
+  let flushTimeout = null;
+
+  function flushBuffer() {
+    if (buffer.trim()) {
+      const msg = buffer.replace(/\r/g, '').trim();
+      if (msg) {
+        try {
+          const parsed = JSON.parse(msg);
+          if (parsed.type !== 'auth') handleDeviceMessage(parsed);
+        } catch(e) {
+          handleDeviceMessage({ type: 'log', message: msg, timestamp: new Date().toISOString() });
+        }
+      }
+    }
+    buffer = '';
+  }
 
   socket.on('data', (data) => {
-      // STM32 sends raw JSON. 
-      // It might send multiple JSONs, we parse line-by-line or object by object.
+      lastDataTime = Date.now(); // Обновляем время последних данных
       buffer += data.toString();
       
-      // Simple parsing assuming \n delimiter or simple JSON objects
-      const messages = buffer.split('\n');
-      buffer = messages.pop(); // keep incomplete part in buffer
+      // Сброс таймера при каждом новом куске данных
+      if (flushTimeout) clearTimeout(flushTimeout);
+      
+      // Разделяем по \r\n, \n или \r
+      const messages = buffer.split(/\r?\n|\r/);
+      buffer = messages.pop(); // последний кусок (возможно неполный) остаётся в буфере
       
       for(const msg of messages) {
           if (!msg.trim()) continue;
           try {
               const parsed = JSON.parse(msg);
-              if (parsed.type === 'auth') continue; // Optional for TCP
+              if (parsed.type === 'auth') continue;
               handleDeviceMessage(parsed);
           } catch(e) {
-              console.error('Invalid JSON from TCP:', msg);
+              handleDeviceMessage({ type: 'log', message: msg.trim(), timestamp: new Date().toISOString() });
           }
+      }
+      
+      // Если в буфере что-то осталось и больше данных не приходит — сбросить через 200мс
+      if (buffer.trim()) {
+        flushTimeout = setTimeout(flushBuffer, 200);
       }
   });
 
-  socket.on('close', () => {
-      console.log('TCP Device disconnected');
-      if (stm32Device === socket) {
-          stm32Device = null;
-          broadcastToFrontends({ type: 'device_connection', online: false });
-      }
-  });
-  
+  const disconnectHandler = (reason = 'unknown') => {
+    if (stm32Device === socket) {
+      console.log(`[DISCONNECT] Device disconnected (${reason})`);
+      stm32Device = null;
+      if (flushTimeout) clearTimeout(flushTimeout);
+      broadcastToFrontends({ type: 'device_connection', online: false });
+    }
+  };
+
+  socket.on('close', () => disconnectHandler('close event'));
+  socket.on('end', () => disconnectHandler('end event'));
   socket.on('error', (err) => {
-      console.error('TCP Socket error:', err.message);
+      console.error(`[ERROR] TCP Socket error: ${err.message}`);
+      disconnectHandler(`error: ${err.message}`);
+  });
+  socket.on('timeout', () => {
+      console.log('[TIMEOUT] Socket timeout, closing...');
+      socket.destroy();
+      disconnectHandler('timeout');
   });
 });
 
@@ -105,10 +184,15 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // Forward commands to the TCP device
+    // Forward to the TCP device
     if (stm32Device && !stm32Device.destroyed) {
-      // Append newline to tell STM32 end of JSON
-      stm32Device.write(JSON.stringify(data) + '\n');
+      if (data.type === 'send') {
+        // Отправляем сырой текст напрямую на STM32
+        stm32Device.write(data.data + '\n');
+      } else {
+        // Отправляем JSON-команду
+        stm32Device.write(JSON.stringify(data) + '\n');
+      }
     } else {
       console.log('Cannot forward command, device is disconnected');
       ws.send(JSON.stringify({ type: 'error', message: 'Device disconnected' }));
