@@ -1,0 +1,13 @@
+{
+  "name": "stm32-remote-control-backend",
+  "version": "1.0.0",
+  "description": "Backend server for STM32 remote control",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node mock-device.js & node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0"
+  }
+}
