@@ -3,6 +3,7 @@ const net = require('net');
 
 const WS_PORT = process.env.WS_PORT || 8080;
 const TCP_PORT = process.env.TCP_PORT || 8081;
+const CPLUS_PORT = process.env.CPLUS_PORT || 9000;
 
 // WebSocket Server (for Frontend)
 const wss = new WebSocket.Server({ port: WS_PORT });
@@ -14,8 +15,44 @@ tcpServer.listen(TCP_PORT, () => {
     console.log(`TCP server (STM32/DT-06) started on port ${TCP_PORT}`);
 });
 
+// TCP Server (for C++ App)
+const cplusServer = net.createServer();
+cplusServer.listen(CPLUS_PORT, () => {
+    console.log(`TCP server (C++) started on port ${CPLUS_PORT}`);
+});
+
+cplusServer.on('connection', (socket) => {
+  console.log('[CONNECT] C++ App connected', { remoteAddress: socket.remoteAddress, remotePort: socket.remotePort });
+  cplusDevice = socket;
+  
+  socket.on('data', (data) => {
+    // Forward raw binary data directly to STM32 if connected
+    if (stm32Device && !stm32Device.destroyed && stm32Device.writable) {
+      stm32Device.write(data);
+    }
+    
+    // Отправляем пакет на frontend, чтобы его было видно в терминале UI
+    const hexString = data.toString('hex').match(/.{1,2}/g)?.join(' ') || '';
+    broadcastToFrontends({
+      type: 'log',
+      message: `[C++] TX -> ${hexString}`,
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  socket.on('close', () => {
+    console.log('[DISCONNECT] C++ App disconnected');
+    if (cplusDevice === socket) cplusDevice = null;
+  });
+  socket.on('error', (err) => {
+    console.error(`[ERROR] C++ App Socket error: ${err.message}`);
+    if (cplusDevice === socket) cplusDevice = null;
+  });
+});
+
 // State
 let stm32Device = null; 
+let cplusDevice = null;
 let deviceCheckInterval = null;
 const frontendClients = new Set();
 
@@ -111,6 +148,12 @@ tcpServer.on('connection', (socket) => {
 
   socket.on('data', (data) => {
       lastDataTime = Date.now(); // Обновляем время последних данных
+      
+      // Forward raw data to C++ App if connected
+      if (cplusDevice && !cplusDevice.destroyed && cplusDevice.writable) {
+        cplusDevice.write(data);
+      }
+      
       buffer += data.toString();
       
       // Сброс таймера при каждом новом куске данных
