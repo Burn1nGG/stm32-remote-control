@@ -74,10 +74,10 @@ function handleDeviceMessage(data) {
 tcpServer.on('connection', (socket) => {
   console.log('[CONNECT] TCP Device (STM32) connected', { remoteAddress: socket.remoteAddress, remotePort: socket.remotePort });
   
-  // Включаем TCP Keep-Alive для обнаружения отключения
-  socket.setKeepAlive(true, 2000); // Проверка каждые 2 сек после 2 сек неактивности
+  // Включаем TCP Keep-Alive для обнаружения отключения (настроено для нестабильного пинга через ngrok)
+  socket.setKeepAlive(true, 15000); // Проверка каждые 15 сек
   socket.setNoDelay(true); // Отключаем Nagle для быстрой отправки
-  socket.setTimeout(30000); // 30 сек timeout
+  socket.setTimeout(60000); // 60 сек timeout (2 минуты)
   
   startDeviceCheck();
   
